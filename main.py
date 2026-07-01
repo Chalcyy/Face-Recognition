@@ -25,6 +25,7 @@ Usage:
 
 import pickle
 import time
+from collections import Counter, deque
 from pathlib import Path
 
 import cv2
@@ -51,9 +52,19 @@ FACE_DATA_DIR          = Path("face_data")
 FACE_DB_PATH           = FACE_DATA_DIR / "known_faces.pkl"
 IDENTITY_LOG_PATH      = FACE_DATA_DIR / "identity_log.csv"
 RECOGNITION_THRESHOLD  = 0.55   # lower = stricter match (face_distance units)
-RECOGNIZE_EVERY_N      = 5      # run the (heavier) recognition model every N frames
+RECOGNIZE_EVERY_N      = 8      # run the (heavier) recognition model every N frames
 MIN_SAMPLES_PER_PERSON = 20     # samples collected during --enroll
-MAX_FACES              = 5      # max simultaneous faces MediaPipe will track
+MAX_FACES              = 10      # max simultaneous faces MediaPipe will track
+
+# ── Stability tuning ─────────────────────────────────────────────────────────
+# A single recognition pass can be noisy (blur, angle, lighting) and flip a
+# face between a name and "Unknown" from one pass to the next. To avoid that
+# flicker, each tracked face keeps a short rolling history of raw recognition
+# results and only changes its DISPLAYED label once a result wins a majority
+# vote over that history -- so one bad frame can't flip the label by itself.
+VOTE_HISTORY_LEN   = 5     # how many recent recognition results to remember per face
+VOTE_MIN_AGREEMENT = 3     # how many of those must agree before switching the shown label
+MATCH_MAX_DIST     = 140.0 # px -- how far a box can move between passes and still count as "the same face"
 
 # ── Colours (BGR) ────────────────────────────────────────────────────────────
 C = {
@@ -397,14 +408,14 @@ def run(source=0, model_path=MODEL_PATH, threshold=RECOGNITION_THRESHOLD,
     print(f"  Known identities: {db.summary()}")
     print("=" * 55)
 
-    from collections import deque
     fps_q  = deque(maxlen=30)
     prev_t = time.time()
     fc     = 0
 
-    # tracked_faces holds one entry per currently-visible face, in the SAME
-    # order MediaPipe returns them for this frame. Each entry:
-    #   {"box": (top,right,bottom,left), "name": str, "confidence": float, "known": bool}
+    # tracked_faces is a list of TrackedFace objects, one per currently-visible
+    # face, persisted across frames (matched by position, not index) so each
+    # face keeps its own rolling vote history and only relabels on majority
+    # agreement -- this is what kills the flicker.
     tracked_faces = []
 
     with make_landmarker(model_path, max_faces=max_faces) as lmk:
@@ -428,40 +439,36 @@ def run(source=0, model_path=MODEL_PATH, threshold=RECOGNITION_THRESHOLD,
                 # 1) Compute a box for EVERY detected face this frame.
                 boxes = [landmarks_to_face_box(lm, w, h) for lm in result.face_landmarks]
 
-                # 2) Recognition is the heavier step -- only run it every N
-                #    frames, but when we do, run it for ALL faces at once
-                #    (batched call is much faster than one-by-one).
+                # 2) Re-associate this frame's boxes with existing tracked
+                #    faces (by nearest box-center) BEFORE recognition, so
+                #    vote history stays attached to the same physical face
+                #    even as people move or the box jitters slightly.
+                tracked_faces = _match_boxes_to_tracked(boxes, tracked_faces)
+
+                # 3) Recognition is the heavier step -- only run it every N
+                #    frames, batched across all faces at once. Each result
+                #    is fed into that face's vote history rather than
+                #    overwriting the displayed label directly.
                 if fc % RECOGNIZE_EVERY_N == 0:
-                    embeddings = get_face_embeddings(rgb, boxes, num_jitters=1)
-                    new_tracked = []
-                    for box, emb in zip(boxes, embeddings):
+                    embeddings = get_face_embeddings(
+                        rgb, [f.box for f in tracked_faces], num_jitters=1
+                    )
+                    for face, emb in zip(tracked_faces, embeddings):
                         if emb is not None:
-                            name, confidence = db.identify(emb, threshold=threshold)
-                            known = name != "Unknown"
-                            if id_logger:
-                                id_logger.log(name, confidence)
+                            raw_name, raw_conf = db.identify(emb, threshold=threshold)
                         else:
-                            name, confidence, known = "Unknown", 0.0, False
-                        new_tracked.append({
-                            "box": box, "name": name,
-                            "confidence": confidence, "known": known,
-                        })
-                    tracked_faces = new_tracked
-                else:
-                    # Between recognition passes, keep showing labels but
-                    # refresh box positions every frame so boxes still track
-                    # movement smoothly. Match old faces to new boxes by
-                    # simple nearest-box-center (handles reordering when
-                    # faces move) rather than assuming index alignment.
-                    tracked_faces = _match_boxes_to_tracked(boxes, tracked_faces)
+                            raw_name, raw_conf = "Unknown", 0.0
+                        face.register_vote(raw_name, raw_conf)
+                        if id_logger and face.name != "Unknown":
+                            id_logger.log(face.name, face.confidence)
 
                 for face in tracked_faces:
-                    draw_face_box(frame, face["box"], face["name"],
-                                  face["confidence"], face["known"])
+                    draw_face_box(frame, face.box, face.name,
+                                  face.confidence, face.known)
             else:
                 tracked_faces = []
 
-            n_known   = sum(1 for f in tracked_faces if f["known"])
+            n_known   = sum(1 for f in tracked_faces if f.known)
             n_unknown = len(tracked_faces) - n_known
 
             now = time.time()
@@ -483,8 +490,50 @@ def run(source=0, model_path=MODEL_PATH, threshold=RECOGNITION_THRESHOLD,
     cv2.destroyAllWindows()
     if id_logger:
         id_logger.close()
-    seen = ", ".join(f["name"] for f in tracked_faces) if tracked_faces else "none"
+    seen = ", ".join(f.name for f in tracked_faces) if tracked_faces else "none"
     print(f"\nLast faces seen: {seen}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stable per-face identity tracking (majority-vote smoothing)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TrackedFace:
+    """
+    Represents one physical face being tracked across frames. Keeps a short
+    rolling history of raw per-pass recognition results and only changes the
+    DISPLAYED name/known state when a candidate wins a clear majority over
+    that history. This is what prevents a single bad frame (blur, angle,
+    lighting) from flipping the label back and forth every recognition pass.
+    """
+    __slots__ = ("box", "name", "confidence", "known", "_history")
+
+    def __init__(self, box):
+        self.box        = box
+        self.name        = "Unknown"
+        self.confidence  = 0.0
+        self.known       = False
+        self._history    = deque(maxlen=VOTE_HISTORY_LEN)
+
+    def register_vote(self, raw_name, raw_conf):
+        self._history.append(raw_name)
+
+        counts = Counter(self._history)
+        top_name, top_count = counts.most_common(1)[0]
+
+        # Only switch the displayed label once a candidate has a clear
+        # majority (>= VOTE_MIN_AGREEMENT out of the recent history) --
+        # otherwise keep showing whatever was stable before, so a single
+        # stray "Unknown" (or a single stray wrong name) can't flip it.
+        if top_count >= VOTE_MIN_AGREEMENT and top_name != self.name:
+            self.name  = top_name
+            self.known = top_name != "Unknown"
+
+        # Confidence display always reflects the latest matched pass for
+        # whichever name currently won the vote (freshest useful number),
+        # falling back to the raw value if names disagree this round.
+        if raw_name == self.name:
+            self.confidence = raw_conf
 
 
 def _box_center(box):
@@ -492,23 +541,23 @@ def _box_center(box):
     return ((left + right) / 2.0, (top + bottom) / 2.0)
 
 
-def _match_boxes_to_tracked(boxes, tracked_faces, max_dist=120.0):
+def _match_boxes_to_tracked(boxes, tracked_faces, max_dist=MATCH_MAX_DIST):
     """
-    Between (heavier) recognition passes, MediaPipe still gives us fresh
-    boxes every frame. This reassigns each previous identity to the nearest
-    new box (by center distance) so labels keep following the right face as
-    people move, instead of assuming face order/index stays constant.
-    Boxes with no close previous match are shown as Unknown until the next
-    recognition pass runs.
+    Reassigns each new frame's boxes to existing TrackedFace objects by
+    nearest box-center, so vote history (and therefore the stable label)
+    stays attached to the same physical face as people move -- instead of
+    assuming face order/index stays constant frame to frame. Boxes with no
+    close previous match get a brand-new TrackedFace (starts as Unknown
+    until enough recognition passes vote it in).
     """
     used = set()
     result = []
-    prev_centers = [(_box_center(f["box"]), f) for f in tracked_faces]
+    prev = [( _box_center(f.box), f) for f in tracked_faces]
 
     for box in boxes:
         c = _box_center(box)
         best_i, best_d = None, max_dist
-        for i, (pc, f) in enumerate(prev_centers):
+        for i, (pc, f) in enumerate(prev):
             if i in used:
                 continue
             d = ((c[0] - pc[0]) ** 2 + (c[1] - pc[1]) ** 2) ** 0.5
@@ -516,16 +565,11 @@ def _match_boxes_to_tracked(boxes, tracked_faces, max_dist=120.0):
                 best_i, best_d = i, d
         if best_i is not None:
             used.add(best_i)
-            prev = prev_centers[best_i][1]
-            result.append({
-                "box": box, "name": prev["name"],
-                "confidence": prev["confidence"], "known": prev["known"],
-            })
+            face = prev[best_i][1]
+            face.box = box   # refresh position, keep identity + vote history
+            result.append(face)
         else:
-            result.append({
-                "box": box, "name": "Unknown",
-                "confidence": 0.0, "known": False,
-            })
+            result.append(TrackedFace(box))
     return result
 
 
