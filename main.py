@@ -54,7 +54,7 @@ IDENTITY_LOG_PATH      = FACE_DATA_DIR / "identity_log.csv"
 RECOGNITION_THRESHOLD  = 0.55   # lower = stricter match (face_distance units)
 RECOGNIZE_EVERY_N      = 8      # run the (heavier) recognition model every N frames
 MIN_SAMPLES_PER_PERSON = 20     # samples collected during --enroll
-MAX_FACES              = 10      # max simultaneous faces MediaPipe will track
+MAX_FACES              = 10     # max simultaneous faces MediaPipe will track
 
 # ── Stability tuning ─────────────────────────────────────────────────────────
 # A single recognition pass can be noisy (blur, angle, lighting) and flip a
@@ -62,9 +62,10 @@ MAX_FACES              = 10      # max simultaneous faces MediaPipe will track
 # flicker, each tracked face keeps a short rolling history of raw recognition
 # results and only changes its DISPLAYED label once a result wins a majority
 # vote over that history -- so one bad frame can't flip the label by itself.
-VOTE_HISTORY_LEN   = 5     # how many recent recognition results to remember per face
-VOTE_MIN_AGREEMENT = 3     # how many of those must agree before switching the shown label
-MATCH_MAX_DIST     = 140.0 # px -- how far a box can move between passes and still count as "the same face"
+VOTE_HISTORY_LEN    = 9     # how many recent recognition results to remember per face
+VOTE_MIN_AGREEMENT  = 6     # how many of those must agree before switching the shown label
+MATCH_MAX_DIST       = 140.0 # px -- how far a box can move between passes and still count as "the same face"
+MISSED_FRAMES_GRACE  = 10    # frames a face can go undetected before it's dropped (avoids reset on a blink/brief occlusion)
 
 # ── Colours (BGR) ────────────────────────────────────────────────────────────
 C = {
@@ -201,8 +202,46 @@ def make_landmarker(model_path, max_faces=MAX_FACES):
         min_face_detection_confidence=0.5,
         min_face_presence_confidence=0.5,
         min_tracking_confidence=0.5,
+        output_face_blendshapes=True,   # needed for expression detection
     )
     return FaceLandmarker.create_from_options(opts)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Expression detection (from MediaPipe blendshapes)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Each expression is defined as a set of blendshape names (MediaPipe's
+# ARKit-style 52 blendshapes) whose scores we sum/average. This avoids
+# needing a second model -- FaceLandmarker already computes these per face
+# whenever output_face_blendshapes=True.
+EXPRESSION_RULES = {
+    "Happy":     (["mouthSmileLeft", "mouthSmileRight"], 0.35),
+    "Sad":       (["mouthFrownLeft", "mouthFrownRight", "browDownLeft", "browDownRight"], 0.25),
+    "Surprised": (["jawOpen", "browInnerUp", "eyeWideLeft", "eyeWideRight"], 0.30),
+    "Angry":     (["browDownLeft", "browDownRight", "noseSneerLeft", "noseSneerRight"], 0.30),
+    "Disgusted": (["noseSneerLeft", "noseSneerRight", "mouthUpperUpLeft", "mouthUpperUpRight"], 0.30),
+}
+
+
+def detect_expression(blendshapes):
+    """
+    Given a face's blendshape list (result.face_blendshapes[i]), score every
+    rule in EXPRESSION_RULES and return (label, score). Falls back to
+    "Neutral" if nothing crosses its threshold.
+    """
+    if not blendshapes:
+        return "Neutral", 0.0
+
+    scores = {b.category_name: b.score for b in blendshapes}
+
+    best_label, best_score = "Neutral", 0.0
+    for label, (names, threshold) in EXPRESSION_RULES.items():
+        vals = [scores.get(n, 0.0) for n in names]
+        avg  = sum(vals) / len(vals) if vals else 0.0
+        if avg >= threshold and avg > best_score:
+            best_label, best_score = label, avg
+    return best_label, best_score
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -250,7 +289,7 @@ class IdentityLogger:
 # Drawing
 # ══════════════════════════════════════════════════════════════════════════════
 
-def draw_face_box(frame, box, name, confidence, known):
+def draw_face_box(frame, box, name, confidence, known, expression=None):
     top, right, bottom, left = box
     col = C["known"] if known else C["unknown"]
     cv2.rectangle(frame, (left, top), (right, bottom), col, 2)
@@ -260,6 +299,12 @@ def draw_face_box(frame, box, name, confidence, known):
     cv2.rectangle(frame, (left, bottom), (left + tw + 16, bottom + th + 16), col, -1)
     cv2.putText(frame, label, (left + 8, bottom + th + 8),
                 cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+    if expression:
+        (ew, eh), _ = cv2.getTextSize(expression, cv2.FONT_HERSHEY_DUPLEX, 0.5, 1)
+        cv2.rectangle(frame, (left, top - eh - 14), (left + ew + 16, top), C["accent"], -1)
+        cv2.putText(frame, expression, (left + 8, top - 8),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.5, (20, 20, 20), 1, cv2.LINE_AA)
 
 
 def draw_hud(frame, fps, db_summary, n_known=0, n_unknown=0):
@@ -438,12 +483,20 @@ def run(source=0, model_path=MODEL_PATH, threshold=RECOGNITION_THRESHOLD,
             if result and result.face_landmarks:
                 # 1) Compute a box for EVERY detected face this frame.
                 boxes = [landmarks_to_face_box(lm, w, h) for lm in result.face_landmarks]
+                blendshapes_by_box = (
+                    result.face_blendshapes if result.face_blendshapes
+                    else [None] * len(boxes)
+                )
 
                 # 2) Re-associate this frame's boxes with existing tracked
                 #    faces (by nearest box-center) BEFORE recognition, so
                 #    vote history stays attached to the same physical face
                 #    even as people move or the box jitters slightly.
-                tracked_faces = _match_boxes_to_tracked(boxes, tracked_faces)
+                #    Blendshapes travel alongside their box so expression
+                #    stays correctly paired with the right face too.
+                tracked_faces = _match_boxes_to_tracked(
+                    boxes, tracked_faces, blendshapes_by_box
+                )
 
                 # 3) Recognition is the heavier step -- only run it every N
                 #    frames, batched across all faces at once. Each result
@@ -462,11 +515,17 @@ def run(source=0, model_path=MODEL_PATH, threshold=RECOGNITION_THRESHOLD,
                         if id_logger and face.name != "Unknown":
                             id_logger.log(face.name, face.confidence)
 
+                # 4) Expression is set inside _match_boxes_to_tracked from
+                #    the blendshapes paired with each box -- read straight
+                #    from the landmarker's output, no extra model call, so
+                #    it updates every frame (cheap) rather than being gated
+                #    behind RECOGNIZE_EVERY_N like recognition is.
+
                 for face in tracked_faces:
                     draw_face_box(frame, face.box, face.name,
-                                  face.confidence, face.known)
+                                  face.confidence, face.known, face.expression)
             else:
-                tracked_faces = []
+                tracked_faces = age_out_lost_faces(tracked_faces)
 
             n_known   = sum(1 for f in tracked_faces if f.known)
             n_unknown = len(tracked_faces) - n_known
@@ -506,7 +565,7 @@ class TrackedFace:
     that history. This is what prevents a single bad frame (blur, angle,
     lighting) from flipping the label back and forth every recognition pass.
     """
-    __slots__ = ("box", "name", "confidence", "known", "_history")
+    __slots__ = ("box", "name", "confidence", "known", "_history", "expression", "missed")
 
     def __init__(self, box):
         self.box        = box
@@ -514,6 +573,8 @@ class TrackedFace:
         self.confidence  = 0.0
         self.known       = False
         self._history    = deque(maxlen=VOTE_HISTORY_LEN)
+        self.expression  = "Neutral"
+        self.missed      = 0   # consecutive frames this face wasn't re-detected
 
     def register_vote(self, raw_name, raw_conf):
         self._history.append(raw_name)
@@ -541,7 +602,7 @@ def _box_center(box):
     return ((left + right) / 2.0, (top + bottom) / 2.0)
 
 
-def _match_boxes_to_tracked(boxes, tracked_faces, max_dist=MATCH_MAX_DIST):
+def _match_boxes_to_tracked(boxes, tracked_faces, blendshapes_by_box=None, max_dist=MATCH_MAX_DIST):
     """
     Reassigns each new frame's boxes to existing TrackedFace objects by
     nearest box-center, so vote history (and therefore the stable label)
@@ -549,12 +610,19 @@ def _match_boxes_to_tracked(boxes, tracked_faces, max_dist=MATCH_MAX_DIST):
     assuming face order/index stays constant frame to frame. Boxes with no
     close previous match get a brand-new TrackedFace (starts as Unknown
     until enough recognition passes vote it in).
+
+    blendshapes_by_box, if given, must be the same length/order as boxes --
+    each face's expression is (re)computed here every frame straight from
+    its blendshapes, since that's cheap and doesn't need the vote-smoothing
+    recognition does.
     """
     used = set()
     result = []
     prev = [( _box_center(f.box), f) for f in tracked_faces]
+    if blendshapes_by_box is None:
+        blendshapes_by_box = [None] * len(boxes)
 
-    for box in boxes:
+    for box, shapes in zip(boxes, blendshapes_by_box):
         c = _box_center(box)
         best_i, best_d = None, max_dist
         for i, (pc, f) in enumerate(prev):
@@ -567,10 +635,32 @@ def _match_boxes_to_tracked(boxes, tracked_faces, max_dist=MATCH_MAX_DIST):
             used.add(best_i)
             face = prev[best_i][1]
             face.box = box   # refresh position, keep identity + vote history
-            result.append(face)
+            face.missed = 0
         else:
-            result.append(TrackedFace(box))
+            face = TrackedFace(box)
+
+        if shapes:
+            face.expression, _ = detect_expression(shapes)
+
+        result.append(face)
     return result
+
+
+def age_out_lost_faces(tracked_faces):
+    """
+    Called on a frame where MediaPipe reports ZERO faces at all (e.g. a
+    blink, brief motion blur, or someone turning their head for an instant).
+    Instead of wiping every tracked face immediately -- which would cause
+    the box/label to disappear and reappear as "new" (losing vote history
+    and looking unstable) -- each face gets a few frames of grace
+    (MISSED_FRAMES_GRACE) before being dropped for real.
+    """
+    survivors = []
+    for face in tracked_faces:
+        face.missed += 1
+        if face.missed <= MISSED_FRAMES_GRACE:
+            survivors.append(face)
+    return survivors
 
 
 # ══════════════════════════════════════════════════════════════════════════════
